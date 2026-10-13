@@ -4,6 +4,7 @@ import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import net from 'net';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import logger from './utils/logger.js';
@@ -68,6 +69,20 @@ const staticDir = path.join(__dirname, '../dist');
 app.use(express.static(staticDir));
 // Also serve frontend assets
 app.use(express.static(path.join(__dirname, '../dist/frontend')));
+// Serve Excalidraw library packs (.excalidrawlib) from EXCALIDRAW_LIBS_DIR.
+// The canvas frontend loads them into the library sidebar on start.
+const libsDir = process.env.EXCALIDRAW_LIBS_DIR?.trim();
+if (libsDir) {
+  app.use('/libs', express.static(libsDir, { index: false }));
+  app.get('/api/libraries', (_req: Request, res: Response) => {
+    try {
+      const names = fs.readdirSync(libsDir).filter(f => f.endsWith('.excalidrawlib')).sort();
+      res.json({ success: true, libraries: names });
+    } catch (error) {
+      res.status(500).json({ success: false, error: (error as Error).message });
+    }
+  });
+}
 // Serve Excalidraw fonts so the font subsetting worker can fetch them for export
 app.use('/assets/fonts', express.static(
   path.join(__dirname, '../node_modules/@excalidraw/excalidraw/dist/prod/fonts')

@@ -119,6 +119,40 @@ function App(): JSX.Element {
   // and correctly points it back here, but nothing receives what it returns —
   // the install silently does nothing.
   useHandleLibrary({ excalidrawAPI, adapter: libraryAdapter })
+
+  // Preload library packs served by the canvas server (EXCALIDRAW_LIBS_DIR).
+  // Items merge by id, so reloading never duplicates them.
+  useEffect(() => {
+    if (!excalidrawAPI) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch('/api/libraries')
+        if (!res.ok) return
+        const { libraries } = await res.json() as { libraries: string[] }
+        const items: any[] = []
+        for (const name of libraries) {
+          try {
+            const lib = await (await fetch(`/libs/${encodeURIComponent(name)}`)).json()
+            const base = name.replace(/\.excalidrawlib$/, '')
+            if (Array.isArray(lib.libraryItems)) {
+              lib.libraryItems.forEach((it: any, i: number) =>
+                items.push({ ...it, id: it.id || `${base}-${i}`, status: it.status || 'published', name: it.name || `${base} ${i + 1}` }))
+            } else if (Array.isArray(lib.library)) {
+              lib.library.forEach((elements: any[], i: number) =>
+                items.push({ id: `${base}-${i}`, status: 'published', created: Date.now(), name: `${base} ${i + 1}`, elements }))
+            }
+          } catch (error) {
+            console.warn(`Failed to load library ${name}:`, error)
+          }
+        }
+        if (!cancelled && items.length) await excalidrawAPI.updateLibrary({ libraryItems: items, merge: true })
+      } catch (error) {
+        console.warn('Failed to preload libraries:', error)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [excalidrawAPI])
   const [isConnected, setIsConnected] = useState<boolean>(false)
   const websocketRef = useRef<WebSocket | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
