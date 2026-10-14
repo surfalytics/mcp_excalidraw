@@ -83,6 +83,11 @@ if (libsDir) {
     }
   });
 }
+// Serve the Excalidraw package assets (fonts) for the frontend: window.EXCALIDRAW_ASSET_PATH
+app.use('/excalidraw-assets', express.static(
+  path.join(__dirname, '../node_modules/@excalidraw/excalidraw/dist/prod'),
+  { maxAge: '30d', immutable: true }
+));
 // Serve Excalidraw fonts so the font subsetting worker can fetch them for export
 app.use('/assets/fonts', express.static(
   path.join(__dirname, '../node_modules/@excalidraw/excalidraw/dist/prod/fonts')

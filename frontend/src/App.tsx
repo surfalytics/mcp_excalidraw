@@ -331,6 +331,22 @@ function App(): JSX.Element {
     }
     sceneLoadStatusRef.current = 'ready'
     setSceneLoadStatus('ready')
+    // WebKit (Safari, the macOS app) can paint the first frame before the
+    // hand-drawn fonts are usable in canvas and never repaints the text. Bump
+    // text element versions shortly after load so the cached shapes are rebuilt.
+    for (const delay of [400, 1600]) {
+      setTimeout(() => {
+        if (generation !== sceneGenerationRef.current) return
+        const current = api.getSceneElements()
+        if (!current.some(el => el.type === 'text')) return
+        applySceneUpdateWithoutAutoSync(api, {
+          elements: current.map(el => el.type === 'text'
+            ? { ...el, version: el.version + 1, versionNonce: Math.floor(Math.random() * 2 ** 31) }
+            : el),
+          captureUpdate: CaptureUpdateAction.NEVER
+        })
+      }, delay)
+    }
   }
 
   useEffect(() => {
