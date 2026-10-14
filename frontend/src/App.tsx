@@ -339,8 +339,12 @@ function App(): JSX.Element {
         if (generation !== sceneGenerationRef.current) return
         const current = api.getSceneElements()
         if (!current.some(el => el.type === 'text')) return
+        // Re-measure with the real fonts (widths measured with a fallback font
+        // are too narrow and make text wrap), then bump versions to repaint.
+        let refreshed: readonly ExcalidrawElement[] = current
+        try { refreshed = prepareServerScene(current, { refreshDimensions: true }) } catch { /* keep current */ }
         applySceneUpdateWithoutAutoSync(api, {
-          elements: current.map(el => el.type === 'text'
+          elements: refreshed.map(el => el.type === 'text'
             ? { ...el, version: el.version + 1, versionNonce: Math.floor(Math.random() * 2 ** 31) }
             : el),
           captureUpdate: CaptureUpdateAction.NEVER
