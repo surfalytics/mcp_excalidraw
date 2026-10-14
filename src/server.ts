@@ -985,13 +985,29 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
 // are rendered headless into <dir>/.thumbs. The current scene name is in <dir>/.current.
 const scenesDir = process.env.EXCALIDRAW_SCENES_DIR?.trim();
 const SCENE_EXT = '.excalidraw';
+// A scene name may include "/" for subfolders: "work/architecture". No "..", no hidden parts.
 const safeSceneName = (name: unknown): string | null => {
   if (typeof name !== 'string') return null;
-  const n = name.trim().replace(/[\/\\:*?"<>|]/g, '-').slice(0, 80);
-  return n && !n.startsWith('.') ? n : null;
+  const parts = name.replace(/\\/g, '/').split('/').map(p => p.trim().replace(/[:*?"<>|]/g, '-').slice(0, 80)).filter(Boolean);
+  if (parts.length === 0 || parts.some(p => p === '..' || p.startsWith('.'))) return null;
+  return parts.join('/');
 };
 const scenePath = (name: string) => path.join(scenesDir!, name + SCENE_EXT);
 const thumbPath = (name: string) => path.join(scenesDir!, '.thumbs', name + '.png');
+const ensureParent = (file: string) => fs.mkdirSync(path.dirname(file), { recursive: true });
+// Folders = real subdirectories (hidden ones skipped), including empty ones.
+function listFolders(): string[] {
+  const out: string[] = [];
+  const walk = (dir: string, rel: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const r = rel ? `${rel}/${entry.name}` : entry.name;
+      out.push(r); walk(path.join(dir, entry.name), r);
+    }
+  };
+  if (scenesDir && fs.existsSync(scenesDir)) walk(scenesDir, '');
+  return out.sort();
+}
 const currentScenePath = () => path.join(scenesDir!, '.current');
 const readCurrentScene = (): string | null => {
   try { return fs.readFileSync(currentScenePath(), 'utf8').trim() || null; } catch { return null; }
@@ -1032,7 +1048,7 @@ async function saveCurrentScene(force = false): Promise<string | null> {
   if (!name) return null;
   const sig = sceneSignature();
   if (!force && sig === lastSavedSignature) return name;
-  fs.mkdirSync(scenesDir, { recursive: true });
+  ensureParent(scenePath(name));
   const tmp = scenePath(name) + '.tmp';
   fs.writeFileSync(tmp, sceneFileJson());
   fs.renameSync(tmp, scenePath(name));
@@ -1067,13 +1083,23 @@ function loadSceneIntoCanvas(name: string): number {
 
 function listScenes() {
   if (!scenesDir || !fs.existsSync(scenesDir)) return [];
-  return fs.readdirSync(scenesDir).filter(f => f.endsWith(SCENE_EXT)).map(f => {
-    const name = f.slice(0, -SCENE_EXT.length);
-    const st = fs.statSync(path.join(scenesDir, f));
-    let elementCount = 0;
-    try { const j = JSON.parse(fs.readFileSync(path.join(scenesDir, f), 'utf8')); elementCount = (j.elements || j).length; } catch { /* unreadable */ }
-    return { name, updatedAt: st.mtime.toISOString(), elementCount, thumbnail: fs.existsSync(thumbPath(name)) ? `/api/scenes/thumb/${encodeURIComponent(name)}?t=${st.mtimeMs}` : null };
-  }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const out: { name: string; folder: string; title: string; updatedAt: string; elementCount: number; thumbnail: string | null }[] = [];
+  const walk = (dir: string, rel: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      if (entry.isDirectory()) { walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name); continue; }
+      if (!entry.name.endsWith(SCENE_EXT)) continue;
+      const title = entry.name.slice(0, -SCENE_EXT.length);
+      const name = rel ? `${rel}/${title}` : title;
+      const st = fs.statSync(path.join(dir, entry.name));
+      let elementCount = 0;
+      try { const j = JSON.parse(fs.readFileSync(path.join(dir, entry.name), 'utf8')); elementCount = (j.elements || j).length; } catch { /* unreadable */ }
+      out.push({ name, folder: rel, title, updatedAt: st.mtime.toISOString(), elementCount,
+                 thumbnail: fs.existsSync(thumbPath(name)) ? `/api/scenes/thumb?name=${encodeURIComponent(name)}&t=${st.mtimeMs}` : null });
+    }
+  };
+  walk(scenesDir, '');
+  return out.sort((a, b) => a.folder.localeCompare(b.folder) || b.updatedAt.localeCompare(a.updatedAt));
 }
 
 if (scenesDir) {
@@ -1082,13 +1108,30 @@ if (scenesDir) {
   setInterval(() => { void saveCurrentScene(); }, 10_000);
 
   app.get('/api/scenes', (_req: Request, res: Response) => {
-    res.json({ success: true, current: readCurrentScene(), scenes: listScenes() });
+    res.json({ success: true, current: readCurrentScene(), folders: listFolders(), scenes: listScenes() });
   });
-  app.get('/api/scenes/thumb/:name', (req: Request, res: Response) => {
-    const name = safeSceneName(req.params.name);
+  app.get('/api/scenes/thumb', (req: Request, res: Response) => {
+    const name = safeSceneName(req.query.name);
     if (!name || !fs.existsSync(thumbPath(name))) return res.status(404).end();
     res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(thumbPath(name));
+  });
+  app.post('/api/scenes/folders', (req: Request, res: Response) => {
+    const name = safeSceneName(req.body?.name);
+    if (!name) return res.status(400).json({ success: false, error: 'Invalid folder name' });
+    fs.mkdirSync(path.join(scenesDir, name), { recursive: true });
+    broadcast({ type: 'scenes_changed' } as any);
+    res.json({ success: true, name });
+  });
+  app.delete('/api/scenes/folders', (req: Request, res: Response) => {
+    const name = safeSceneName(req.query.name);
+    const dir = name ? path.join(scenesDir, name) : '';
+    if (!name || !fs.existsSync(dir)) return res.status(404).json({ success: false, error: 'Folder not found' });
+    if (fs.readdirSync(dir).some(f => !f.startsWith('.'))) return res.status(409).json({ success: false, error: 'Folder is not empty' });
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(path.join(scenesDir, '.thumbs', name), { recursive: true, force: true });
+    broadcast({ type: 'scenes_changed' } as any);
+    res.json({ success: true });
   });
   app.post('/api/scenes/save', async (_req: Request, res: Response) => {
     try { res.json({ success: true, name: await saveCurrentScene(true) }); }
@@ -1112,6 +1155,7 @@ if (scenesDir) {
     if (!name) return res.status(400).json({ success: false, error: 'Invalid name' });
     if (fs.existsSync(scenePath(name))) return res.status(409).json({ success: false, error: 'Scene exists' });
     try {
+      ensureParent(scenePath(name));
       await saveCurrentScene(true);
       if (!req.body?.fromCurrent) {
         commitCanvasMutation(() => { elements.clear(); });
@@ -1122,18 +1166,18 @@ if (scenesDir) {
       res.json({ success: true, name });
     } catch (error) { res.status(500).json({ success: false, error: (error as Error).message }); }
   });
-  app.patch('/api/scenes/:name', (req: Request, res: Response) => {
-    const from = safeSceneName(req.params.name), to = safeSceneName(req.body?.name);
+  app.patch('/api/scenes', (req: Request, res: Response) => {
+    const from = safeSceneName(req.body?.from), to = safeSceneName(req.body?.name);
     if (!from || !to || !fs.existsSync(scenePath(from))) return res.status(400).json({ success: false, error: 'Invalid name' });
     if (fs.existsSync(scenePath(to))) return res.status(409).json({ success: false, error: 'Scene exists' });
-    fs.renameSync(scenePath(from), scenePath(to));
-    if (fs.existsSync(thumbPath(from))) fs.renameSync(thumbPath(from), thumbPath(to));
+    ensureParent(scenePath(to)); fs.renameSync(scenePath(from), scenePath(to));
+    if (fs.existsSync(thumbPath(from))) { ensureParent(thumbPath(to)); fs.renameSync(thumbPath(from), thumbPath(to)); }
     if (readCurrentScene() === from) writeCurrentScene(to);
     broadcast({ type: 'scenes_changed' } as any);
     res.json({ success: true, name: to });
   });
-  app.delete('/api/scenes/:name', (req: Request, res: Response) => {
-    const name = safeSceneName(req.params.name);
+  app.delete('/api/scenes', (req: Request, res: Response) => {
+    const name = safeSceneName(req.query.name);
     if (!name || !fs.existsSync(scenePath(name))) return res.status(404).json({ success: false, error: 'Scene not found' });
     if (readCurrentScene() === name) return res.status(409).json({ success: false, error: 'Open another scene first' });
     fs.rmSync(scenePath(name)); fs.rmSync(thumbPath(name), { force: true });

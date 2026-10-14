@@ -154,8 +154,17 @@ function App(): JSX.Element {
     return () => { cancelled = true }
   }, [excalidrawAPI])
   // Scenes sidebar (multi-diagram workspace backed by EXCALIDRAW_SCENES_DIR)
-  type SceneInfo = { name: string; updatedAt: string; elementCount: number; thumbnail: string | null }
+  type SceneInfo = { name: string; folder: string; title: string; updatedAt: string; elementCount: number; thumbnail: string | null }
   const [scenes, setScenes] = useState<SceneInfo[]>([])
+  const [folders, setFolders] = useState<string[]>([])
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(window.localStorage?.getItem('excalidraw-scenes-collapsed') || '{}') } catch { return {} }
+  })
+  const toggleFolder = (f: string): void => setCollapsed(c => {
+    const next = { ...c, [f]: !c[f] }
+    try { window.localStorage?.setItem('excalidraw-scenes-collapsed', JSON.stringify(next)) } catch { /* ignore */ }
+    return next
+  })
   const [currentScene, setCurrentScene] = useState<string | null>(null)
   const [scenesEnabled, setScenesEnabled] = useState<boolean>(false)
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
@@ -168,6 +177,7 @@ function App(): JSX.Element {
       const data = await res.json()
       setScenesEnabled(true)
       setScenes(data.scenes || [])
+      setFolders(data.folders || [])
       setCurrentScene(data.current || null)
     } catch { setScenesEnabled(false) }
   }
@@ -184,21 +194,47 @@ function App(): JSX.Element {
     await syncToBackend({ silent: true }).catch(() => undefined)
     await sceneAction('POST', '/api/scenes/open', { name })
   }
-  const newScene = async (): Promise<void> => {
-    const name = window.prompt('New diagram name')
-    if (!name) return
+  const newScene = async (folder = ''): Promise<void> => {
+    const title = window.prompt(folder ? `New diagram in "${folder}"` : 'New diagram name')
+    if (!title) return
     await syncToBackend({ silent: true }).catch(() => undefined)
-    await sceneAction('POST', '/api/scenes', { name })
+    await sceneAction('POST', '/api/scenes', { name: folder ? `${folder}/${title}` : title })
   }
+  const newFolder = async (): Promise<void> => {
+    const name = window.prompt('New folder name (use / for nested folders)')
+    if (!name) return
+    await sceneAction('POST', '/api/scenes/folders', { name })
+  }
+  // Rename or move: the prompt shows the full path, so "work/arch" moves it into the work folder.
   const renameScene = async (name: string): Promise<void> => {
-    const to = window.prompt('Rename diagram', name)
+    const to = window.prompt('Rename or move (folder/name)', name)
     if (!to || to === name) return
-    await sceneAction('PATCH', `/api/scenes/${encodeURIComponent(name)}`, { name: to })
+    await sceneAction('PATCH', '/api/scenes', { from: name, name: to })
   }
   const deleteScene = async (name: string): Promise<void> => {
     if (!window.confirm(`Delete "${name}"? The file is removed from disk.`)) return
-    await sceneAction('DELETE', `/api/scenes/${encodeURIComponent(name)}`)
+    await sceneAction('DELETE', `/api/scenes?name=${encodeURIComponent(name)}`)
   }
+  const deleteFolder = async (name: string): Promise<void> => {
+    if (!window.confirm(`Delete empty folder "${name}"?`)) return
+    await sceneAction('DELETE', `/api/scenes/folders?name=${encodeURIComponent(name)}`)
+  }
+  const sceneCard = (sc: SceneInfo): React.ReactElement => (
+    <div key={sc.name} className={`scene-card ${sc.name === currentScene ? 'scene-current' : ''}`}
+         onClick={() => void openScene(sc.name)} title={`${sc.name} · ${sc.elementCount} elements`}>
+      <div className="scene-thumb">
+        {sc.thumbnail ? <img src={sc.thumbnail} alt="" loading="lazy" /> : <div className="scene-thumb-empty" />}
+      </div>
+      <div className="scene-meta">
+        <div className="scene-name">{sc.title}</div>
+        <div className="scene-time">{formatSyncTime(new Date(sc.updatedAt))}</div>
+      </div>
+      <div className="scene-actions" onClick={e => e.stopPropagation()}>
+        <button className="btn-icon" title="Rename or move" onClick={() => void renameScene(sc.name)}>✎</button>
+        {sc.name !== currentScene && <button className="btn-icon" title="Delete" onClick={() => void deleteScene(sc.name)}>🗑</button>}
+      </div>
+    </div>
+  )
   useEffect(() => { void refreshScenes() }, [])
   useEffect(() => { try { window.localStorage?.setItem('excalidraw-scenes-sidebar', sidebarOpen ? 'open' : 'closed') } catch { /* ignore */ } }, [sidebarOpen])
 
@@ -1021,26 +1057,33 @@ function App(): JSX.Element {
         <aside className="scenes-sidebar">
           <div className="scenes-head">
             <span>Diagrams</span>
-            <button className="btn-primary btn-small" onClick={() => void newScene()} title="New diagram">+</button>
+            <div>
+              <button className="btn-icon" onClick={() => void newFolder()} title="New folder">📁+</button>
+              <button className="btn-primary btn-small" onClick={() => void newScene()} title="New diagram">+</button>
+            </div>
           </div>
           <div className="scenes-list">
-            {scenes.length === 0 && <div className="scenes-empty">No diagrams yet. Click + to create one.</div>}
-            {scenes.map(sc => (
-              <div key={sc.name} className={`scene-card ${sc.name === currentScene ? 'scene-current' : ''}`}
-                   onClick={() => void openScene(sc.name)} title={`${sc.elementCount} elements`}>
-                <div className="scene-thumb">
-                  {sc.thumbnail ? <img src={sc.thumbnail} alt="" loading="lazy" /> : <div className="scene-thumb-empty" />}
+            {scenes.length === 0 && folders.length === 0 && <div className="scenes-empty">No diagrams yet. Click + to create one.</div>}
+            {scenes.filter(sc => !sc.folder).map(sceneCard)}
+            {folders.map(f => {
+              const inFolder = scenes.filter(sc => sc.folder === f)
+              const depth = f.split('/').length - 1
+              return (
+                <div key={f} className="scene-folder" style={{ marginLeft: depth * 12 }}>
+                  <div className="scene-folder-head" onClick={() => toggleFolder(f)}>
+                    <span className="scene-folder-caret">{collapsed[f] ? '▸' : '▾'}</span>
+                    <span className="scene-folder-name">📁 {f.split('/').pop()}</span>
+                    <span className="scene-folder-count">{inFolder.length}</span>
+                    <div className="scene-actions" onClick={e => e.stopPropagation()}>
+                      <button className="btn-icon" title="New diagram here" onClick={() => void newScene(f)}>+</button>
+                      {inFolder.length === 0 && !folders.some(o => o !== f && o.startsWith(f + '/')) &&
+                        <button className="btn-icon" title="Delete folder" onClick={() => void deleteFolder(f)}>🗑</button>}
+                    </div>
+                  </div>
+                  {!collapsed[f] && inFolder.map(sceneCard)}
                 </div>
-                <div className="scene-meta">
-                  <div className="scene-name">{sc.name}</div>
-                  <div className="scene-time">{formatSyncTime(new Date(sc.updatedAt))}</div>
-                </div>
-                <div className="scene-actions" onClick={e => e.stopPropagation()}>
-                  <button className="btn-icon" title="Rename" onClick={() => void renameScene(sc.name)}>✎</button>
-                  {sc.name !== currentScene && <button className="btn-icon" title="Delete" onClick={() => void deleteScene(sc.name)}>🗑</button>}
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </aside>
       )}
