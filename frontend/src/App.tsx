@@ -153,6 +153,55 @@ function App(): JSX.Element {
     })()
     return () => { cancelled = true }
   }, [excalidrawAPI])
+  // Scenes sidebar (multi-diagram workspace backed by EXCALIDRAW_SCENES_DIR)
+  type SceneInfo = { name: string; updatedAt: string; elementCount: number; thumbnail: string | null }
+  const [scenes, setScenes] = useState<SceneInfo[]>([])
+  const [currentScene, setCurrentScene] = useState<string | null>(null)
+  const [scenesEnabled, setScenesEnabled] = useState<boolean>(false)
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    try { return window.localStorage?.getItem('excalidraw-scenes-sidebar') !== 'closed' } catch { return true }
+  })
+  const refreshScenes = async (): Promise<void> => {
+    try {
+      const res = await fetch('/api/scenes')
+      if (!res.ok) { setScenesEnabled(false); return }
+      const data = await res.json()
+      setScenesEnabled(true)
+      setScenes(data.scenes || [])
+      setCurrentScene(data.current || null)
+    } catch { setScenesEnabled(false) }
+  }
+  const sceneAction = async (method: string, url: string, body?: unknown): Promise<boolean> => {
+    const res = await fetch(url, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || data.success === false) { window.alert(data.error || 'Scene action failed'); return false }
+    await refreshScenes()
+    return true
+  }
+  const openScene = async (name: string): Promise<void> => {
+    if (name === currentScene) return
+    // Push unsaved edits first so nothing is lost when the server swaps scenes.
+    await syncToBackend({ silent: true }).catch(() => undefined)
+    await sceneAction('POST', '/api/scenes/open', { name })
+  }
+  const newScene = async (): Promise<void> => {
+    const name = window.prompt('New diagram name')
+    if (!name) return
+    await syncToBackend({ silent: true }).catch(() => undefined)
+    await sceneAction('POST', '/api/scenes', { name })
+  }
+  const renameScene = async (name: string): Promise<void> => {
+    const to = window.prompt('Rename diagram', name)
+    if (!to || to === name) return
+    await sceneAction('PATCH', `/api/scenes/${encodeURIComponent(name)}`, { name: to })
+  }
+  const deleteScene = async (name: string): Promise<void> => {
+    if (!window.confirm(`Delete "${name}"? The file is removed from disk.`)) return
+    await sceneAction('DELETE', `/api/scenes/${encodeURIComponent(name)}`)
+  }
+  useEffect(() => { void refreshScenes() }, [])
+  useEffect(() => { try { window.localStorage?.setItem('excalidraw-scenes-sidebar', sidebarOpen ? 'open' : 'closed') } catch { /* ignore */ } }, [sidebarOpen])
+
   const [isConnected, setIsConnected] = useState<boolean>(false)
   const websocketRef = useRef<WebSocket | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -490,6 +539,10 @@ function App(): JSX.Element {
 
         case 'sync_status':
           console.log(`Server sync status: ${data.count} elements`)
+          break
+
+        case 'scenes_changed':
+          void refreshScenes()
           break
 
         case 'canvas_cleared':
@@ -909,7 +962,12 @@ function App(): JSX.Element {
     <div className="app" data-theme={theme}>
       {/* Header */}
       <div className="header">
-        <h1>Excalidraw Canvas</h1>
+        <div className="header-left">
+          {scenesEnabled && (
+            <button className="btn-icon" title="Toggle diagrams sidebar" onClick={() => setSidebarOpen(o => !o)}>☰</button>
+          )}
+          <h1>{currentScene ?? 'Excalidraw Canvas'}</h1>
+        </div>
         <div className="controls">
           <div className="status">
             <div className={`status-dot ${isConnected ? 'status-connected' : 'status-disconnected'}`}></div>
@@ -958,6 +1016,34 @@ function App(): JSX.Element {
         </div>
       )}
 
+      <div className="workspace">
+      {scenesEnabled && sidebarOpen && (
+        <aside className="scenes-sidebar">
+          <div className="scenes-head">
+            <span>Diagrams</span>
+            <button className="btn-primary btn-small" onClick={() => void newScene()} title="New diagram">+</button>
+          </div>
+          <div className="scenes-list">
+            {scenes.length === 0 && <div className="scenes-empty">No diagrams yet. Click + to create one.</div>}
+            {scenes.map(sc => (
+              <div key={sc.name} className={`scene-card ${sc.name === currentScene ? 'scene-current' : ''}`}
+                   onClick={() => void openScene(sc.name)} title={`${sc.elementCount} elements`}>
+                <div className="scene-thumb">
+                  {sc.thumbnail ? <img src={sc.thumbnail} alt="" loading="lazy" /> : <div className="scene-thumb-empty" />}
+                </div>
+                <div className="scene-meta">
+                  <div className="scene-name">{sc.name}</div>
+                  <div className="scene-time">{formatSyncTime(new Date(sc.updatedAt))}</div>
+                </div>
+                <div className="scene-actions" onClick={e => e.stopPropagation()}>
+                  <button className="btn-icon" title="Rename" onClick={() => void renameScene(sc.name)}>✎</button>
+                  {sc.name !== currentScene && <button className="btn-icon" title="Delete" onClick={() => void deleteScene(sc.name)}>🗑</button>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </aside>
+      )}
       {/* Canvas Container */}
       <div className="canvas-container">
         <div
@@ -991,6 +1077,7 @@ function App(): JSX.Element {
             }}
           />
         </div>
+      </div>
       </div>
     </div>
   )

@@ -979,6 +979,169 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
   }
 });
 
+// ─── Scenes (multi-diagram workspace) ─────────────────────────
+// Each scene is a .excalidraw file in EXCALIDRAW_SCENES_DIR. The canvas shows one
+// scene at a time; switching saves the current one and loads the next. Thumbnails
+// are rendered headless into <dir>/.thumbs. The current scene name is in <dir>/.current.
+const scenesDir = process.env.EXCALIDRAW_SCENES_DIR?.trim();
+const SCENE_EXT = '.excalidraw';
+const safeSceneName = (name: unknown): string | null => {
+  if (typeof name !== 'string') return null;
+  const n = name.trim().replace(/[\/\\:*?"<>|]/g, '-').slice(0, 80);
+  return n && !n.startsWith('.') ? n : null;
+};
+const scenePath = (name: string) => path.join(scenesDir!, name + SCENE_EXT);
+const thumbPath = (name: string) => path.join(scenesDir!, '.thumbs', name + '.png');
+const currentScenePath = () => path.join(scenesDir!, '.current');
+const readCurrentScene = (): string | null => {
+  try { return fs.readFileSync(currentScenePath(), 'utf8').trim() || null; } catch { return null; }
+};
+const writeCurrentScene = (name: string | null) => {
+  if (name) fs.writeFileSync(currentScenePath(), name); else fs.rmSync(currentScenePath(), { force: true });
+};
+let sceneDirty = false;
+let lastSavedSignature = '';
+const sceneSignature = () => `${elements.size}:${files.size}:` + Array.from(elements.values()).map(e => `${e.id}${(e as any).version ?? ''}${(e as any).updatedAt ?? ''}${e.x}${e.y}${e.width}${e.height}${(e as any).text ?? ''}`).join('|');
+
+function sceneFileJson(): string {
+  const filesObj: Record<string, ExcalidrawFile> = {};
+  files.forEach((f, id) => { filesObj[id] = f; });
+  return JSON.stringify({
+    type: 'excalidraw', version: 2, source: 'mcp-excalidraw-server',
+    elements: Array.from(elements.values()),
+    appState: { viewBackgroundColor: '#ffffff', gridSize: null },
+    ...(files.size > 0 ? { files: filesObj } : {})
+  }, null, 2);
+}
+
+async function writeThumb(name: string): Promise<void> {
+  try {
+    if (elements.size === 0) { fs.rmSync(thumbPath(name), { force: true }); return; }
+    const scene = { elements: Array.from(elements.values()), files: Object.fromEntries(files) };
+    const result = await renderScene(scene, { format: 'png', scale: 1, padding: 20 });
+    fs.mkdirSync(path.dirname(thumbPath(name)), { recursive: true });
+    fs.writeFileSync(thumbPath(name), Buffer.from(result.data, 'base64'));
+  } catch (error) {
+    logger.warn(`Thumbnail for scene ${name} failed:`, error);
+  }
+}
+
+async function saveCurrentScene(force = false): Promise<string | null> {
+  if (!scenesDir) return null;
+  const name = readCurrentScene();
+  if (!name) return null;
+  const sig = sceneSignature();
+  if (!force && sig === lastSavedSignature) return name;
+  fs.mkdirSync(scenesDir, { recursive: true });
+  const tmp = scenePath(name) + '.tmp';
+  fs.writeFileSync(tmp, sceneFileJson());
+  fs.renameSync(tmp, scenePath(name));
+  lastSavedSignature = sig;
+  sceneDirty = false;
+  await writeThumb(name);
+  broadcast({ type: 'scenes_changed' } as any);
+  return name;
+}
+
+function loadSceneIntoCanvas(name: string): number {
+  const raw = JSON.parse(fs.readFileSync(scenePath(name), 'utf8'));
+  const incoming: any[] = Array.isArray(raw) ? raw : (raw.elements || []);
+  const incomingFiles = raw.files && typeof raw.files === 'object' ? Object.values(raw.files) : [];
+  const preparedFiles = prepareFileWrites(incomingFiles);
+  commitCanvasMutation(() => {
+    elements.clear();
+    preparedFiles.forEach(f => files.set(f.id, f));
+    incoming.forEach((el: any) => {
+      if (!el || el.isDeleted) return;
+      const id = el.id || generateId();
+      elements.set(id, { ...el, id, version: el.version ?? 1 });
+    });
+  });
+  const filesObj: Record<string, ExcalidrawFile> = {};
+  files.forEach((f, id) => { filesObj[id] = f; });
+  broadcast({ type: 'initial_elements', elements: Array.from(elements.values()),
+              ...(files.size > 0 ? { files: filesObj } : {}) } as any);
+  lastSavedSignature = sceneSignature();
+  return elements.size;
+}
+
+function listScenes() {
+  if (!scenesDir || !fs.existsSync(scenesDir)) return [];
+  return fs.readdirSync(scenesDir).filter(f => f.endsWith(SCENE_EXT)).map(f => {
+    const name = f.slice(0, -SCENE_EXT.length);
+    const st = fs.statSync(path.join(scenesDir, f));
+    let elementCount = 0;
+    try { const j = JSON.parse(fs.readFileSync(path.join(scenesDir, f), 'utf8')); elementCount = (j.elements || j).length; } catch { /* unreadable */ }
+    return { name, updatedAt: st.mtime.toISOString(), elementCount, thumbnail: fs.existsSync(thumbPath(name)) ? `/api/scenes/thumb/${encodeURIComponent(name)}?t=${st.mtimeMs}` : null };
+  }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+if (scenesDir) {
+  fs.mkdirSync(scenesDir, { recursive: true });
+  // Autosave the current scene every 10 s when something changed.
+  setInterval(() => { void saveCurrentScene(); }, 10_000);
+
+  app.get('/api/scenes', (_req: Request, res: Response) => {
+    res.json({ success: true, current: readCurrentScene(), scenes: listScenes() });
+  });
+  app.get('/api/scenes/thumb/:name', (req: Request, res: Response) => {
+    const name = safeSceneName(req.params.name);
+    if (!name || !fs.existsSync(thumbPath(name))) return res.status(404).end();
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(thumbPath(name));
+  });
+  app.post('/api/scenes/save', async (_req: Request, res: Response) => {
+    try { res.json({ success: true, name: await saveCurrentScene(true) }); }
+    catch (error) { res.status(500).json({ success: false, error: (error as Error).message }); }
+  });
+  // Open an existing scene (saves the current one first).
+  app.post('/api/scenes/open', async (req: Request, res: Response) => {
+    const name = safeSceneName(req.body?.name);
+    if (!name || !fs.existsSync(scenePath(name))) return res.status(404).json({ success: false, error: 'Scene not found' });
+    try {
+      await saveCurrentScene(true);
+      writeCurrentScene(name);
+      const count = loadSceneIntoCanvas(name);
+      broadcast({ type: 'scenes_changed' } as any);
+      res.json({ success: true, name, count });
+    } catch (error) { res.status(500).json({ success: false, error: (error as Error).message }); }
+  });
+  // Create a new scene. `fromCurrent: true` keeps the canvas content as the new scene; default starts empty.
+  app.post('/api/scenes', async (req: Request, res: Response) => {
+    const name = safeSceneName(req.body?.name);
+    if (!name) return res.status(400).json({ success: false, error: 'Invalid name' });
+    if (fs.existsSync(scenePath(name))) return res.status(409).json({ success: false, error: 'Scene exists' });
+    try {
+      await saveCurrentScene(true);
+      if (!req.body?.fromCurrent) {
+        commitCanvasMutation(() => { elements.clear(); });
+        broadcast({ type: 'canvas_cleared' } as any);
+      }
+      writeCurrentScene(name);
+      await saveCurrentScene(true);
+      res.json({ success: true, name });
+    } catch (error) { res.status(500).json({ success: false, error: (error as Error).message }); }
+  });
+  app.patch('/api/scenes/:name', (req: Request, res: Response) => {
+    const from = safeSceneName(req.params.name), to = safeSceneName(req.body?.name);
+    if (!from || !to || !fs.existsSync(scenePath(from))) return res.status(400).json({ success: false, error: 'Invalid name' });
+    if (fs.existsSync(scenePath(to))) return res.status(409).json({ success: false, error: 'Scene exists' });
+    fs.renameSync(scenePath(from), scenePath(to));
+    if (fs.existsSync(thumbPath(from))) fs.renameSync(thumbPath(from), thumbPath(to));
+    if (readCurrentScene() === from) writeCurrentScene(to);
+    broadcast({ type: 'scenes_changed' } as any);
+    res.json({ success: true, name: to });
+  });
+  app.delete('/api/scenes/:name', (req: Request, res: Response) => {
+    const name = safeSceneName(req.params.name);
+    if (!name || !fs.existsSync(scenePath(name))) return res.status(404).json({ success: false, error: 'Scene not found' });
+    if (readCurrentScene() === name) return res.status(409).json({ success: false, error: 'Open another scene first' });
+    fs.rmSync(scenePath(name)); fs.rmSync(thumbPath(name), { force: true });
+    broadcast({ type: 'scenes_changed' } as any);
+    res.json({ success: true });
+  });
+}
+
 // ─── Files API (for image elements) ───────────────────────────
 // GET all files
 app.get('/api/files', (_req: Request, res: Response) => {
